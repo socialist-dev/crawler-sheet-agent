@@ -1,25 +1,30 @@
-import { TaskDefinition, ExtractedItem } from './types';
+import { TaskDefinition } from './types';
 import { searchJina, RawScrapedPost } from './jina';
 import { searchFirecrawl } from './firecrawl';
-import { evaluateContent, generateDynamicDorks, sleep } from './gemini';
+import { batchEvaluateContent, generateDynamicDorks, sleep } from './gemini';
 import { exportToGoogleSheet } from './sheet';
 
 export async function runTask(
   task: TaskDefinition,
-  keys: { jina: string; firecrawl: string; gemini: string; sheetUrl: string }
+  keys: { jina: string; firecrawl: string; gemini: string; defaultSheetUrl: string }
 ) {
   if (!task.enabled) {
     console.log(`⏩ [BỎ QUA TASK] ${task.name} (Đang bị vô hiệu hóa)`);
     return;
   }
 
+  const targetWebhookUrl = (task.webhookEnvVar && process.env[task.webhookEnvVar]) 
+    ? process.env[task.webhookEnvVar]! 
+    : keys.defaultSheetUrl;
+
   console.log(`\n======================================================`);
-  console.log(`🚀 BẮT ĐẦU TÁC VỤ: [${task.name}] -> TAB: [${task.targetSheetTab}]`);
+  console.log(`🚀 BẮT ĐẦU TÁC VỤ: [${task.name}]`);
+  console.log(`📍 TAB ĐÍCH: [${task.targetSheetTab}] | Lọc: &tbs=${task.timeFilter}`);
   console.log(`======================================================`);
 
   const rawPosts: RawScrapedPost[] = [];
 
-  // 1. Quét Dorks mặc định
+  // 1. Cào toàn bộ Dorking
   for (const dork of task.dorks) {
     console.log(`🔍 [Jina Search]: ${dork}`);
     const jinaRes = await searchJina(dork, keys.jina, task.timeFilter);
@@ -30,60 +35,39 @@ export async function runTask(
       const fcRes = await searchFirecrawl(dork, keys.firecrawl, task.timeFilter);
       rawPosts.push(...fcRes);
     }
-    await sleep(1000);
+    await sleep(500); // Chỉ nghỉ 0.5s giữa các dork
   }
 
+  // 2. Khử trùng URL trước khi đưa vào AI
   let uniquePosts = Array.from(new Map(rawPosts.map(p => [p.url, p])).values());
 
-  // 2. Kích hoạt AI Dynamic Dorks nếu ít kết quả
+  // 3. Tự động sinh Dorking nếu ít kết quả
   if (uniquePosts.length < 3 && task.dynamicDorks?.enabled) {
     console.log(`⚡ Kết quả ít (<3). AI đang tự tạo Dorking bổ sung...`);
     const extraDorks = await generateDynamicDorks(task, keys.gemini);
     for (const dork of extraDorks) {
       const res = await searchJina(dork, keys.jina, task.timeFilter);
       rawPosts.push(...res);
-      await sleep(1000);
     }
     uniquePosts = Array.from(new Map(rawPosts.map(p => [p.url, p])).values());
   }
 
-  console.log(`📌 Gom được ${uniquePosts.length} bài. Bắt đầu đưa Gemini thẩm định...`);
-  const finalItems: ExtractedItem[] = [];
+  console.log(`📌 Gom được tổng cộng ${uniquePosts.length} bài viết thô.`);
 
-  // 3. Đưa qua Gemini xử lý tuần tự với delay an toàn
-  for (let i = 0; i < uniquePosts.length; i++) {
-    const post = uniquePosts[i];
-    console.log(`[${i + 1}/${uniquePosts.length}] Thẩm định: ${post.url}`);
+  // 4. GOM TOÀN BỘ VÀO 1 LẦN THẨM ĐỊNH AI DUY NHẤT (Batch Call)
+  if (uniquePosts.length > 0) {
+    const approvedJobs = await batchEvaluateContent(uniquePosts, task, keys.gemini);
+    console.log(`🎯 AI đã duyệt ${approvedJobs.length}/${uniquePosts.length} bài chất lượng cao.`);
 
-    const result = await evaluateContent(post.rawContent, task, keys.gemini);
-
-    if (result && result.isValid && result.isWithinTime) {
-      console.log(`✅ [DUYỆT - ${result.postedAgo}] [${result.categoryTag}] ${result.title}`);
-      finalItems.push({
-        scanTime: new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }),
-        platform: post.platform,
-        postedAgo: result.postedAgo,
-        categoryTag: result.categoryTag,
-        scoreOrPriority: result.scoreOrPriority,
-        title: result.title,
-        contentOrBrief: result.contentOrBrief,
-        extraField1: result.extraField1,
-        extraField2: result.extraField2,
-        url: post.url
-      });
-    } else {
-      console.log(`⏩ [BỎ QUA]: ${post.url}`);
+    for (const job of approvedJobs) {
+      console.log(`✅ [${job.postedAgo}] [${job.categoryTag}] [${job.scoreOrPriority}] ${job.title}`);
     }
 
-    if (i < uniquePosts.length - 1) {
-      await sleep(3000); // 3s an toàn 15-20 RPM
+    // 5. Xuất Google Sheet ngay lập tức
+    if (approvedJobs.length > 0) {
+      await exportToGoogleSheet(task.targetSheetTab, approvedJobs, targetWebhookUrl);
     }
-  }
-
-  // 4. Xuất Google Sheet
-  if (finalItems.length > 0) {
-    await exportToGoogleSheet(task.targetSheetTab, finalItems, keys.sheetUrl);
   } else {
-    console.log(`✨ Không có dữ liệu mới đạt chuẩn cho tác vụ [${task.name}].`);
+    console.log(`✨ Không cào được bài viết thô nào cho tác vụ [${task.name}].`);
   }
 }

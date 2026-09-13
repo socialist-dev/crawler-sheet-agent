@@ -6,8 +6,7 @@ import { IdeaMiningTask } from './tasks/idea-mining';
 // Tập hợp tất cả các task bạn muốn hệ thống chạy
 const REGISTERED_TASKS = [
   FreelanceJobsTask,
-  ArtCommissionTask,
-  IdeaMiningTask
+  ArtCommissionTask
 ];
 
 async function main() {

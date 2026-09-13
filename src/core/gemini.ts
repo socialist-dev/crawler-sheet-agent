@@ -1,25 +1,15 @@
-import { TaskDefinition } from './types';
+import { TaskDefinition, ExtractedItem } from './types';
+import { RawScrapedPost } from './jina';
 
 export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-export interface AIAnalysisResult {
-  isValid: boolean;
-  isWithinTime: boolean;
-  postedAgo: string;
-  categoryTag: string;
-  scoreOrPriority: string;
-  title: string;
-  contentOrBrief: string;
-  extraField1: string;
-  extraField2: string;
-}
-
-export async function evaluateContent(
-  rawContent: string,
+export async function batchEvaluateContent(
+  posts: RawScrapedPost[],
   task: TaskDefinition,
-  geminiKey: string,
-  retries = 3
-): Promise<AIAnalysisResult | null> {
+  geminiKey: string
+): Promise<ExtractedItem[]> {
+  if (posts.length === 0) return [];
+
   const MODEL = 'gemini-3.1-flash-lite';
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${geminiKey}`;
 
@@ -31,39 +21,56 @@ export async function evaluateContent(
     day: '2-digit'
   });
 
+  // Gom toàn bộ danh sách bài viết thành 1 văn bản ngữ cảnh duy nhất
+  const formattedPostsText = posts.map((post, index) => `
+--- [BÀI VIẾT #${index + 1}] ---
+ID: ${index + 1}
+PLATFORM: ${post.platform}
+URL: ${post.url}
+NỘI DUNG RAW:
+${post.rawContent.slice(0, 1500)} // Giới hạn 1500 ký tự mỗi bài để tối ưu token
+`).join('\n\n');
+
   const prompt = `
 ${task.aiPrompt.systemRole}
 HÔM NAY LÀ NGÀY: ${todayVN} (Giờ Việt Nam).
 
-=== DỮ LIỆU CÀO ĐƯỢC ===
-${rawContent}
-========================
+Dưới đây là danh sách ${posts.length} bài viết cào được từ mạng xã hội/diễn đàn.
+Nhiệm vụ: Hãy thẩm định TOÀN BỘ danh sách và CHỈ TRẢ VỀ các bài viết ĐẠT CHUẨN theo quy tắc bên dưới.
+
+=== DANH SÁCH BÀI VIẾT (${posts.length} BÀI) ===
+${formattedPostsText}
+==============================================
 
 QUY TẮC THẨM ĐỊNH CHO TÁC VỤ [${task.name}]:
 ${task.aiPrompt.validationRules}
 
-TIÊU CHÍ BẮT BUỘC:
-1. LỌC THỜI GIAN: So sánh với ngày HÔM NAY (${todayVN}). Nếu bài viết có ngày đăng cũ hơn mốc thời gian quy định (tháng trước, năm ngoái...) -> Đặt "isWithinTime = false".
-2. PHÂN LOẠI TAG: Chọn tag phù hợp nhất từ danh sách: [${task.aiPrompt.categoryTags.join(', ')}].
-3. TRƯỜNG THÔNG TIN PHỤ:
-   - extraField1 (${task.aiPrompt.extraField1Label}): Trích xuất chính xác.
-   - extraField2 (${task.aiPrompt.extraField2Label}): Trích xuất chính xác.
+TIÊU CHÍ BẮT BUỘC ĐỂ DUYỆT (CHỈ TRẢ VỀ BÀI ĐẠT CHUẨN):
+1. LỌC THỜI GIAN: So sánh với ngày HÔM NAY (${todayVN}). CHỈ LẤY bài đăng trong 7 ngày trở lại ("vừa xong", "1-6 ngày trước"...). LOẠI BỎ bài từ tháng trước, năm ngoái, > 7 ngày.
+2. PHÂN LOẠI TAG: Chọn tag từ danh sách: [${task.aiPrompt.categoryTags.join(', ')}].
+3. THÔNG TIN PHỤ:
+   - extraField1: Trích xuất ${task.aiPrompt.extraField1Label}.
+   - extraField2: Trích xuất ${task.aiPrompt.extraField2Label}.
+4. CHỈ TRẢ VỀ MẢNG CÁC BÀI ĐẠT YÊU CẦU (Bỏ qua toàn bộ bài rác, bài chào dịch vụ hoặc bài cũ).
 `;
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            responseSchema: {
+  try {
+    console.log(`🧠 Đang gửi ${posts.length} bài viết sang Gemini 3.1 Flash Lite thẩm định 1 lượt...`);
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(30000), // 30s timeout cho mảng lớn
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: 'ARRAY',
+            items: {
               type: 'OBJECT',
               properties: {
-                isValid: { type: 'BOOLEAN' },
-                isWithinTime: { type: 'BOOLEAN' },
+                url: { type: 'STRING' },
+                platform: { type: 'STRING' },
                 postedAgo: { type: 'STRING' },
                 categoryTag: { type: 'STRING' },
                 scoreOrPriority: { type: 'STRING' },
@@ -72,47 +79,60 @@ TIÊU CHÍ BẮT BUỘC:
                 extraField1: { type: 'STRING' },
                 extraField2: { type: 'STRING' }
               },
-              required: ['isValid', 'isWithinTime', 'postedAgo', 'categoryTag', 'scoreOrPriority', 'title', 'contentOrBrief', 'extraField1', 'extraField2']
+              required: ['url', 'platform', 'postedAgo', 'categoryTag', 'scoreOrPriority', 'title', 'contentOrBrief', 'extraField1', 'extraField2']
             }
           }
-        })
-      });
+        }
+      })
+    });
 
-      if (response.status === 503 || response.status === 429) {
-        const waitTime = attempt * 4000;
-        console.warn(`[Gemini] Quá tải (${response.status}). Thử lại sau ${waitTime / 1000}s...`);
-        await sleep(waitTime);
-        continue;
-      }
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('[Gemini Batch] Lỗi phản hồi API:', errText);
+      return [];
+    }
 
-      if (!response.ok) return null;
+    const data = (await response.json()) as any;
+    const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!jsonText) return [];
 
-      const data = (await response.json()) as any;
-      const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!jsonText) return null;
+    const approvedItems = JSON.parse(jsonText) as any[];
 
-      const result = JSON.parse(jsonText) as AIAnalysisResult;
+    // Lớp lọc code bổ sung: đảm bảo không sót bài cũ
+    const currentYear = now.getFullYear().toString();
+    const validItems: ExtractedItem[] = [];
 
-      // Lớp chặn cứng ngày tháng cũ
-      const lower = (result.postedAgo || '').toLowerCase();
-      const currentYear = now.getFullYear().toString();
-      if (
+    for (const item of approvedItems) {
+      const lower = (item.postedAgo || '').toLowerCase();
+      const isOld = (
         (lower.includes('tháng') && !lower.includes('trước')) ||
         lower.includes('month') ||
         lower.includes('tuần trước') ||
         lower.includes('weeks ago') ||
         (lower.match(/202[0-5]/) && !lower.includes(currentYear))
-      ) {
-        result.isWithinTime = false;
-      }
+      );
 
-      return result;
-    } catch {
-      if (attempt === retries) return null;
-      await sleep(3000);
+      if (!isOld && item.url) {
+        validItems.push({
+          scanTime: new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }),
+          platform: item.platform,
+          postedAgo: item.postedAgo,
+          categoryTag: item.categoryTag,
+          scoreOrPriority: item.scoreOrPriority,
+          title: item.title,
+          contentOrBrief: item.contentOrBrief,
+          extraField1: item.extraField1,
+          extraField2: item.extraField2,
+          url: item.url
+        });
+      }
     }
+
+    return validItems;
+  } catch (err: any) {
+    console.error('[Gemini Batch] Lỗi thẩm định:', err.message);
+    return [];
   }
-  return null;
 }
 
 export async function generateDynamicDorks(task: TaskDefinition, geminiKey: string): Promise<string[]> {
@@ -121,13 +141,14 @@ export async function generateDynamicDorks(task: TaskDefinition, geminiKey: stri
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${geminiKey}`;
 
   const prompt = `
-Hãy tạo 3 câu Google Dorking nâng cao dựa trên yêu cầu sau:
+Hãy tạo 3 câu Google Dorking nâng cao bằng tiếng Việt dựa trên yêu cầu sau:
 ${task.dynamicDorks.instruction}
 Trả về mảng JSON 3 chuỗi: ["dork 1", "dork 2", "dork 3"]
 `;
 
   try {
     const res = await fetch(url, {
+      signal: AbortSignal.timeout(10000),
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

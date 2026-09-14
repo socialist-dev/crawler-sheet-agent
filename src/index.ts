@@ -1,11 +1,13 @@
 import { runTask } from './core/engine';
 import { FreelanceJobsTask } from './tasks/freelance-jobs';
 import { ArtCommissionTask } from './tasks/art-commission';
+import { SalesDataDemandTask } from './tasks/sales-data-demand';
 
 // Chỉ đăng ký 2 task đang sử dụng thực tế
 const REGISTERED_TASKS = [
   FreelanceJobsTask,
-  ArtCommissionTask
+  ArtCommissionTask,
+  SalesDataDemandTask
 ];
 
 async function main() {
